@@ -1,0 +1,4 @@
+termux-setup-storage
+cd ~/storage/shared/LighthouseAI
+python agent.py
+python dashboard.py

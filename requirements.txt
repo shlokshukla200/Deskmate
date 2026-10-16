@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==22.8
+requests==2.32.3
+flask==3.0.3
+reportlab>=4.0.0
