@@ -27,12 +27,6 @@
       "src": "/(.*)",
       "dest": "/dashboard.py"
     }
-  ],
-  "crons": [
-    {
-      "path": "/api/cron/reminders",
-      "schedule": "* * * * *"
-    }
   ]
 }
 
