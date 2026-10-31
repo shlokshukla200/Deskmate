@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "dashboard.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "api/telegram.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "api/cron/reminders.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/telegram",
+      "dest": "/api/telegram.py"
+    },
+    {
+      "src": "/api/cron/reminders",
+      "dest": "/api/cron/reminders.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/dashboard.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/reminders",
+      "schedule": "* * * * *"
+    }
+  ]
+}
+

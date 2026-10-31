@@ -1204,5 +1204,9 @@ if __name__ == "__main__":
     print("\n* LighthouseAI Dashboard running on http://localhost:8420 (http://127.0.0.1:8420)")
     app.run(host="127.0.0.1", port=8420, debug=False)
 
+# Vercel WSGI entrypoint — Vercel looks for a module-level `app` variable (Flask app)
+# This is already satisfied by `app = Flask(...)` defined above.
+# No changes needed — Vercel's @vercel/python builder imports `app` automatically.
+
 
 

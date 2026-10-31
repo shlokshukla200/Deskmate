@@ -1,16 +1,108 @@
 """
 LighthouseAI — Core Application Engine & Shared Data Layer.
-SQLite Database Manager, Gemini/Groq Fallback Orchestrator, & PDF Generators.
+PostgreSQL Database Manager (Vercel/Neon), Gemini/Groq Fallback Orchestrator, & PDF Generators.
+
+DATABASE: Uses PostgreSQL via DATABASE_URL env var (Neon serverless recommended).
+          Falls back to SQLite (agent.db) automatically when DATABASE_URL is not set
+          — so local development keeps working unchanged.
 """
 
 import os
 import json
-import sqlite3
 import re
 import io
 import html
 from datetime import datetime, timedelta
 import requests
+
+# =========================================================
+# DATABASE ADAPTER — Postgres (Vercel/Neon) or SQLite (local)
+# =========================================================
+# We use a lightweight adapter so the rest of the code stays identical.
+# Postgres uses %s placeholders; SQLite uses ?. The adapter normalises this.
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+if DATABASE_URL:
+    import psycopg2
+    import psycopg2.extras
+
+    class _DBConn:
+        """Thin wrapper matching the sqlite3 Connection/Cursor API for our usage."""
+        def __init__(self):
+            self._conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+            self._conn.autocommit = False
+
+        def cursor(self):
+            return _DBCursor(self._conn.cursor())
+
+        def commit(self):
+            self._conn.commit()
+
+        def close(self):
+            self._conn.close()
+
+    class _DBCursor:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def _pg(self, sql, params=None):
+            """Convert SQLite ? placeholders to Postgres %s."""
+            converted = sql.replace("?", "%s")
+            # Convert SQLite-specific syntax
+            converted = converted.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            converted = converted.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+            return converted, params
+
+        def execute(self, sql, params=None):
+            converted_sql, converted_params = self._pg(sql, params)
+            # Handle INSERT OR REPLACE: convert to upsert for known tables
+            if "INSERT INTO" in converted_sql and "OR REPLACE" in sql:
+                # Already handled above
+                pass
+            self._cur.execute(converted_sql, converted_params)
+
+        def executemany(self, sql, seq):
+            converted_sql, _ = self._pg(sql)
+            self._cur.executemany(converted_sql, seq)
+
+        def fetchone(self):
+            row = self._cur.fetchone()
+            if row is None:
+                return None
+            if isinstance(row, dict):
+                return tuple(row.values())
+            return row
+
+        def fetchall(self):
+            rows = self._cur.fetchall()
+            if rows and isinstance(rows[0], dict):
+                return [tuple(r.values()) for r in rows]
+            return rows
+
+        @property
+        def lastrowid(self):
+            # Postgres: use RETURNING id or currval
+            try:
+                self._cur.execute("SELECT lastval()")
+                return self._cur.fetchone()[0]
+            except Exception:
+                return None
+
+        @property
+        def rowcount(self):
+            return self._cur.rowcount
+
+    def _get_db_conn():
+        return _DBConn()
+
+else:
+    import sqlite3
+    BASE_DIR_FOR_DB = os.path.dirname(os.path.abspath(__file__))
+    _SQLITE_PATH = os.path.join(BASE_DIR_FOR_DB, "agent.db")
+
+    def _get_db_conn():
+        return sqlite3.connect(_SQLITE_PATH)
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -25,6 +117,7 @@ from reportlab.lib.units import inch
 # =========================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# DB_PATH used only in SQLite (local) mode; ignored when DATABASE_URL is set
 DB_PATH = os.path.join(BASE_DIR, "agent.db")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -59,34 +152,39 @@ def get_config():
 
 
 def save_env_var(key: str, value: str):
-    """Safely update or add an environment variable in .env."""
-    lines = []
-    found = False
-    if os.path.exists(ENV_PATH):
+    """
+    Update an environment variable at runtime.
+    On Vercel the filesystem is read-only, so we only update os.environ in memory.
+    For local dev, also writes to .env if it exists.
+    """
+    os.environ[key] = str(value)
+    # Only attempt .env file write in local (non-Vercel) mode
+    if not DATABASE_URL and os.path.exists(ENV_PATH):
+        lines = []
         try:
             with open(ENV_PATH, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except Exception:
             lines = []
 
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(f"{key}=") or stripped.startswith(f"#{key}="):
+        found = False
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(f"{key}=") or stripped.startswith(f"#{key}="):
+                new_lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                new_lines.append(line)
+
+        if not found:
             new_lines.append(f"{key}={value}\n")
-            found = True
-        else:
-            new_lines.append(line)
 
-    if not found:
-        new_lines.append(f"{key}={value}\n")
-
-    try:
-        with open(ENV_PATH, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-        os.environ[key] = str(value)
-    except Exception as e:
-        print(f"Error saving {key} to .env: {e}")
+        try:
+            with open(ENV_PATH, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+        except Exception as e:
+            print(f"Error saving {key} to .env: {e}")
 
 
 # =========================================================
@@ -94,149 +192,207 @@ def save_env_var(key: str, value: str):
 # =========================================================
 
 def init_db():
-    """Initialize all SQLite tables with auto-migration for missing columns."""
-    conn = sqlite3.connect(DB_PATH)
+    """Initialize all database tables. Works with both PostgreSQL and SQLite."""
+    conn = _get_db_conn()
     c = conn.cursor()
 
-    # Tasks Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            due_time TEXT,
-            done INTEGER DEFAULT 0,
-            notified INTEGER DEFAULT 0,
-            created_at TEXT,
-            notes TEXT DEFAULT '',
-            pomodoro_count INTEGER DEFAULT 0
-        )
-    """)
+    if DATABASE_URL:
+        # PostgreSQL — use SERIAL PRIMARY KEY, TEXT for all string types
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                due_time TEXT,
+                done INTEGER DEFAULT 0,
+                notified INTEGER DEFAULT 0,
+                created_at TEXT,
+                notes TEXT DEFAULT '',
+                pomodoro_count INTEGER DEFAULT 0,
+                timetable_id TEXT DEFAULT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sticky_notes (
+                id SERIAL PRIMARY KEY,
+                title TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                color TEXT DEFAULT 'default',
+                bg_theme TEXT DEFAULT '',
+                note_type TEXT DEFAULT 'text',
+                checklist_items TEXT DEFAULT '[]',
+                drawing_data TEXT DEFAULT '',
+                task_id INTEGER DEFAULT NULL,
+                is_pinned INTEGER DEFAULT 0,
+                is_archived INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saved_timetables (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                date_label TEXT,
+                slots_json TEXT,
+                form_json TEXT,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saved_roadmaps (
+                id SERIAL PRIMARY KEY,
+                exam_date TEXT,
+                study_hours REAL,
+                subjects_json TEXT,
+                syllabus TEXT,
+                phases_json TEXT NOT NULL,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS alarms (
+                id SERIAL PRIMARY KEY,
+                time_str TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT 'Wake Up Alarm',
+                enabled INTEGER DEFAULT 1,
+                ring_days TEXT DEFAULT '[]',
+                target_date TEXT,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS device_status (
+                id INTEGER PRIMARY KEY,
+                battery_percent INTEGER,
+                is_charging INTEGER,
+                last_alerted_50 INTEGER DEFAULT 0,
+                last_alerted_40 INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_heartbeat (
+                id INTEGER PRIMARY KEY,
+                last_seen TEXT,
+                bot_username TEXT,
+                status TEXT
+            )
+        """)
+    else:
+        # SQLite — original schema preserved exactly
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                due_time TEXT,
+                done INTEGER DEFAULT 0,
+                notified INTEGER DEFAULT 0,
+                created_at TEXT,
+                notes TEXT DEFAULT '',
+                pomodoro_count INTEGER DEFAULT 0
+            )
+        """)
 
-    # Check & migrate tasks columns
-    c.execute("PRAGMA table_info(tasks)")
-    task_cols = [r[1] for r in c.fetchall()]
-    if "notes" not in task_cols:
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN notes TEXT DEFAULT ''")
-        except Exception:
-            pass
-    if "pomodoro_count" not in task_cols:
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN pomodoro_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-    if "created_at" not in task_cols:
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN created_at TEXT DEFAULT ''")
-        except Exception:
-            pass
-    if "notified" not in task_cols:
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN notified INTEGER DEFAULT 0")
-        except Exception:
-            pass
-    if "timetable_id" not in task_cols:
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN timetable_id TEXT DEFAULT NULL")
-        except Exception:
-            pass
+        c.execute("PRAGMA table_info(tasks)")
+        task_cols = [r[1] for r in c.fetchall()]
+        for col, col_def in [
+            ("notes", "TEXT DEFAULT ''"),
+            ("pomodoro_count", "INTEGER DEFAULT 0"),
+            ("created_at", "TEXT DEFAULT ''"),
+            ("notified", "INTEGER DEFAULT 0"),
+            ("timetable_id", "TEXT DEFAULT NULL"),
+        ]:
+            if col not in task_cols:
+                try:
+                    c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_def}")
+                except Exception:
+                    pass
 
-    # Google Keep Style Sticky Notes Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sticky_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT DEFAULT '',
-            content TEXT NOT NULL,
-            color TEXT DEFAULT 'default',
-            bg_theme TEXT DEFAULT '',
-            note_type TEXT DEFAULT 'text',
-            checklist_items TEXT DEFAULT '[]',
-            drawing_data TEXT DEFAULT '',
-            task_id INTEGER DEFAULT NULL,
-            is_pinned INTEGER DEFAULT 0,
-            is_archived INTEGER DEFAULT 0,
-            created_at TEXT,
-            updated_at TEXT
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sticky_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                color TEXT DEFAULT 'default',
+                bg_theme TEXT DEFAULT '',
+                note_type TEXT DEFAULT 'text',
+                checklist_items TEXT DEFAULT '[]',
+                drawing_data TEXT DEFAULT '',
+                task_id INTEGER DEFAULT NULL,
+                is_pinned INTEGER DEFAULT 0,
+                is_archived INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
 
-    # Check & migrate sticky_notes columns
-    c.execute("PRAGMA table_info(sticky_notes)")
-    note_cols = [r[1] for r in c.fetchall()]
-    for col, col_def in [
-        ('bg_theme', "TEXT DEFAULT ''"),
-        ('note_type', "TEXT DEFAULT 'text'"),
-        ('checklist_items', "TEXT DEFAULT '[]'"),
-        ('drawing_data', "TEXT DEFAULT ''"),
-        ('task_id', "INTEGER DEFAULT NULL"),
-        ('is_pinned', "INTEGER DEFAULT 0"),
-        ('is_archived', "INTEGER DEFAULT 0")
-    ]:
-        if col not in note_cols:
-            try:
-                c.execute(f"ALTER TABLE sticky_notes ADD COLUMN {col} {col_def}")
-            except Exception:
-                pass
+        c.execute("PRAGMA table_info(sticky_notes)")
+        note_cols = [r[1] for r in c.fetchall()]
+        for col, col_def in [
+            ('bg_theme', "TEXT DEFAULT ''"),
+            ('note_type', "TEXT DEFAULT 'text'"),
+            ('checklist_items', "TEXT DEFAULT '[]'"),
+            ('drawing_data', "TEXT DEFAULT ''"),
+            ('task_id', "INTEGER DEFAULT NULL"),
+            ('is_pinned', "INTEGER DEFAULT 0"),
+            ('is_archived', "INTEGER DEFAULT 0"),
+        ]:
+            if col not in note_cols:
+                try:
+                    c.execute(f"ALTER TABLE sticky_notes ADD COLUMN {col} {col_def}")
+                except Exception:
+                    pass
 
-    # Saved Timetables Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS saved_timetables (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            date_label TEXT,
-            slots_json TEXT,
-            form_json TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # Study Roadmaps Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS saved_roadmaps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exam_date TEXT,
-            study_hours REAL,
-            subjects_json TEXT,
-            syllabus TEXT,
-            phases_json TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-
-    # Alarms Table (Wake Up & Routine Alarms)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS alarms (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time_str TEXT NOT NULL,
-            label TEXT NOT NULL DEFAULT 'Wake Up Alarm',
-            enabled INTEGER DEFAULT 1,
-            ring_days TEXT DEFAULT '[]',
-            target_date TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # Device Battery & Power Status Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS device_status (
-            id INTEGER PRIMARY KEY,
-            battery_percent INTEGER,
-            is_charging INTEGER,
-            last_alerted_50 INTEGER DEFAULT 0,
-            last_alerted_40 INTEGER DEFAULT 0,
-            updated_at TEXT
-        )
-    """)
-
-    # Bot Heartbeat Table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS bot_heartbeat (
-            id INTEGER PRIMARY KEY,
-            last_seen TEXT,
-            bot_username TEXT,
-            status TEXT
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saved_timetables (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                date_label TEXT,
+                slots_json TEXT,
+                form_json TEXT,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saved_roadmaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exam_date TEXT,
+                study_hours REAL,
+                subjects_json TEXT,
+                syllabus TEXT,
+                phases_json TEXT NOT NULL,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS alarms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time_str TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT 'Wake Up Alarm',
+                enabled INTEGER DEFAULT 1,
+                ring_days TEXT DEFAULT '[]',
+                target_date TEXT,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS device_status (
+                id INTEGER PRIMARY KEY,
+                battery_percent INTEGER,
+                is_charging INTEGER,
+                last_alerted_50 INTEGER DEFAULT 0,
+                last_alerted_40 INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_heartbeat (
+                id INTEGER PRIMARY KEY,
+                last_seen TEXT,
+                bot_username TEXT,
+                status TEXT
+            )
+        """)
 
     conn.commit()
     conn.close()
@@ -376,7 +532,7 @@ def call_ai_model(prompt: str, system_prompt: str = "", json_mode: bool = False,
 
 def get_tasks(date_str: str | None = None):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     if date_str:
         c.execute(
@@ -400,7 +556,7 @@ def get_tasks(date_str: str | None = None):
 
 def get_all_tasks():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute(
         "SELECT id, content, due_time, done, created_at, COALESCE(notes, ''), COALESCE(pomodoro_count, 0) FROM tasks "
@@ -413,7 +569,7 @@ def get_all_tasks():
 
 def get_pending_tasks():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute(
         "SELECT id, content, due_time, done, created_at, COALESCE(notes, ''), COALESCE(pomodoro_count, 0) FROM tasks "
@@ -426,7 +582,7 @@ def get_pending_tasks():
 
 def get_task_by_id(task_id: int):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute(
         "SELECT id, content, due_time, done, created_at, COALESCE(notes, ''), COALESCE(pomodoro_count, 0) FROM tasks WHERE id = ?",
@@ -439,15 +595,15 @@ def get_task_by_id(task_id: int):
 
 def add_task(content: str, due_time: str | None = None, notes: str = "", timetable_id: str | None = None):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_iso = datetime.now().isoformat()
     c.execute(
-        "INSERT INTO tasks (content, due_time, done, notified, created_at, notes, pomodoro_count, timetable_id) VALUES (?, ?, 0, 0, ?, ?, 0, ?)",
+        "INSERT INTO tasks (content, due_time, done, notified, created_at, notes, pomodoro_count, timetable_id) VALUES (?, ?, 0, 0, ?, ?, 0, ?)" + (" RETURNING id" if DATABASE_URL else ""),
         (content.strip(), due_time.strip() if due_time else None, now_iso, notes.strip(), timetable_id)
     )
     conn.commit()
-    task_id = c.lastrowid
+    task_id = c.fetchone()[0] if DATABASE_URL else c.lastrowid
 
     # If notes were provided, also create or sync a sticky note
     if notes.strip():
@@ -472,7 +628,7 @@ def edit_task(task_id: int, content: str = None, due_time: str = None, notes: st
     new_due = due_time.strip() if due_time is not None else current[2]
     new_notes = notes.strip() if notes is not None else current[5]
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute(
         "UPDATE tasks SET content = ?, due_time = ?, notes = ? WHERE id = ?",
@@ -504,7 +660,7 @@ def edit_task(task_id: int, content: str = None, due_time: str = None, notes: st
 
 def mark_done(task_id: int, done_val: int = 1) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("UPDATE tasks SET done = ? WHERE id = ?", (done_val, task_id))
     affected = c.rowcount
@@ -515,7 +671,7 @@ def mark_done(task_id: int, done_val: int = 1) -> bool:
 
 def delete_task(task_id: int) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     c.execute("DELETE FROM sticky_notes WHERE task_id = ?", (task_id,))
@@ -527,7 +683,7 @@ def delete_task(task_id: int) -> bool:
 
 def update_task_note(task_id: int, notes: str) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("UPDATE tasks SET notes = ? WHERE id = ?", (notes.strip(), task_id))
     c.execute("SELECT content FROM tasks WHERE id = ?", (task_id,))
@@ -556,7 +712,7 @@ def update_task_note(task_id: int, notes: str) -> bool:
 
 def get_due_unnotified():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     c.execute(
@@ -570,7 +726,7 @@ def get_due_unnotified():
 
 def mark_notified(task_id: int):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("UPDATE tasks SET notified = 1 WHERE id = ?", (task_id,))
     conn.commit()
@@ -595,7 +751,7 @@ def find_tasks_by_query(query: str):
 
 def get_notes(query: str = "", include_archived: bool = False):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
 
     c.execute(
@@ -655,17 +811,17 @@ def get_note_by_id(note_id: int):
 
 def add_note(title: str = "", content: str = "", color: str = "default", bg_theme: str = "", note_type: str = "text", checklist_items: list = None, drawing_data: str = "", is_pinned: bool = False, is_archived: bool = False) -> int:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_iso = datetime.now().isoformat()
     cl_json = json.dumps(checklist_items or [])
 
     c.execute(
         "INSERT INTO sticky_notes (title, content, color, bg_theme, note_type, checklist_items, drawing_data, task_id, is_pinned, is_archived, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)" + (" RETURNING id" if DATABASE_URL else ""),
         (title.strip(), content.strip(), color, bg_theme, note_type, cl_json, drawing_data, 1 if is_pinned else 0, 1 if is_archived else 0, now_iso, now_iso)
     )
-    nid = c.lastrowid
+    nid = c.fetchone()[0] if DATABASE_URL else c.lastrowid
     conn.commit()
     conn.close()
     return nid
@@ -688,7 +844,7 @@ def update_note(note_id: int, **kwargs) -> bool:
     is_archived = kwargs.get("is_archived", current["is_archived"])
     now_iso = datetime.now().isoformat()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
 
     if current["task_id"]:
@@ -710,7 +866,7 @@ def update_note(note_id: int, **kwargs) -> bool:
 
 def delete_note(note_id: int) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT task_id FROM sticky_notes WHERE id = ?", (note_id,))
     row = c.fetchone()
@@ -729,7 +885,7 @@ def delete_note(note_id: int) -> bool:
 
 def get_saved_timetables():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT id, title, date_label, slots_json, form_json, created_at FROM saved_timetables ORDER BY created_at DESC")
     rows = c.fetchall()
@@ -766,17 +922,25 @@ def get_timetable_by_id(tt_id: str):
 
 def save_timetable(t_id: str = None, title: str = "", date_label: str = "", slots: list = None, form_data: dict = None) -> str:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     target_id = str(t_id or int(datetime.now().timestamp() * 1000))
     final_title = title or f"Protocol {target_id[-4:]}"
     final_date = date_label or datetime.now().strftime("%Y-%m-%d")
     now_iso = datetime.now().isoformat()
 
-    c.execute(
-        "INSERT OR REPLACE INTO saved_timetables (id, title, date_label, slots_json, form_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (target_id, final_title, final_date, json.dumps(slots or []), json.dumps(form_data or {}), now_iso)
-    )
+    if DATABASE_URL:
+        c.execute(
+            """INSERT INTO saved_timetables (id, title, date_label, slots_json, form_json, created_at) VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, date_label=EXCLUDED.date_label,
+               slots_json=EXCLUDED.slots_json, form_json=EXCLUDED.form_json""",
+            (target_id, final_title, final_date, json.dumps(slots or []), json.dumps(form_data or {}), now_iso)
+        )
+    else:
+        c.execute(
+            "INSERT OR REPLACE INTO saved_timetables (id, title, date_label, slots_json, form_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (target_id, final_title, final_date, json.dumps(slots or []), json.dumps(form_data or {}), now_iso)
+        )
     conn.commit()
     conn.close()
     return target_id
@@ -784,7 +948,7 @@ def save_timetable(t_id: str = None, title: str = "", date_label: str = "", slot
 
 def rename_timetable(tt_id: str, new_title: str) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("UPDATE saved_timetables SET title = ? WHERE id = ?", (new_title.strip(), str(tt_id)))
     affected = c.rowcount
@@ -795,7 +959,7 @@ def rename_timetable(tt_id: str, new_title: str) -> bool:
 
 def delete_timetable(tt_id: str) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     # Find all tasks linked to this timetable (by timetable_id column or by notes pattern)
     c.execute("SELECT id FROM tasks WHERE timetable_id = ? OR notes LIKE ?", (str(tt_id), f"%[Timetable: {tt_id}]%"))
@@ -868,7 +1032,7 @@ Return ONLY a JSON array of slots with standard 12-hour AM/PM times:
 
 def get_all_roadmaps():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT id, exam_date, study_hours, subjects_json, syllabus, phases_json, created_at FROM saved_roadmaps ORDER BY id DESC")
     rows = c.fetchall()
@@ -897,7 +1061,7 @@ def get_all_roadmaps():
 
 def get_roadmap_by_id(rid: int):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT id, exam_date, study_hours, subjects_json, syllabus, phases_json, created_at FROM saved_roadmaps WHERE id = ?", (int(rid),))
     r = c.fetchone()
@@ -925,7 +1089,7 @@ def get_roadmap_by_id(rid: int):
 
 def delete_roadmap(rid: int) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("DELETE FROM saved_roadmaps WHERE id = ?", (int(rid),))
     affected = c.rowcount
@@ -936,7 +1100,7 @@ def delete_roadmap(rid: int) -> bool:
 
 def get_saved_roadmap():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT id, exam_date, study_hours, subjects_json, syllabus, phases_json, created_at FROM saved_roadmaps ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
@@ -964,14 +1128,15 @@ def get_saved_roadmap():
 
 def save_roadmap(exam_date: str, study_hours: float, subjects: list, syllabus: str, phases: list) -> int:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_iso = datetime.now().isoformat()
     c.execute("""
         INSERT INTO saved_roadmaps (exam_date, study_hours, subjects_json, syllabus, phases_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (exam_date, study_hours, json.dumps(subjects or []), syllabus, json.dumps(phases or []), now_iso))
-    rid = c.lastrowid
+    """ + (" RETURNING id" if DATABASE_URL else ""),
+    (exam_date, study_hours, json.dumps(subjects or []), syllabus, json.dumps(phases or []), now_iso))
+    rid = c.fetchone()[0] if DATABASE_URL else c.lastrowid
     conn.commit()
     conn.close()
     return rid
@@ -983,23 +1148,23 @@ def save_roadmap(exam_date: str, study_hours: float, subjects: list, syllabus: s
 
 def add_alarm(time_str: str, label: str = "Wake Up Alarm", enabled: int = 1, target_date: str = "") -> int:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_iso = datetime.now().isoformat()
     t_date = target_date or datetime.now().strftime("%Y-%m-%d")
     c.execute(
-        "INSERT INTO alarms (time_str, label, enabled, ring_days, target_date, created_at) VALUES (?, ?, ?, '[]', ?, ?)",
+        "INSERT INTO alarms (time_str, label, enabled, ring_days, target_date, created_at) VALUES (?, ?, ?, '[]', ?, ?)" + (" RETURNING id" if DATABASE_URL else ""),
         (time_str.strip(), label.strip(), 1 if enabled else 0, t_date, now_iso)
     )
     conn.commit()
-    aid = c.lastrowid
+    aid = c.fetchone()[0] if DATABASE_URL else c.lastrowid
     conn.close()
     return aid
 
 
 def get_alarms() -> list:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT id, time_str, label, enabled, ring_days, target_date, created_at FROM alarms ORDER BY id DESC")
     rows = c.fetchall()
@@ -1024,7 +1189,7 @@ def get_active_alarms() -> list:
 
 def toggle_alarm(alarm_id: int, enabled: bool = None) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     if enabled is None:
         c.execute("UPDATE alarms SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END WHERE id = ?", (int(alarm_id),))
@@ -1038,7 +1203,7 @@ def toggle_alarm(alarm_id: int, enabled: bool = None) -> bool:
 
 def delete_alarm(alarm_id: int) -> bool:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("DELETE FROM alarms WHERE id = ?", (int(alarm_id),))
     affected = c.rowcount
@@ -1052,7 +1217,7 @@ def get_battery_info() -> dict:
     init_db()
     # 1. Check if client sync updated within last 60 seconds
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_db_conn()
         c = conn.cursor()
         c.execute("SELECT battery_percent, is_charging, updated_at FROM device_status WHERE id = 1")
         row = c.fetchone()
@@ -1071,23 +1236,25 @@ def get_battery_info() -> dict:
     except Exception:
         pass
 
-    # 2. psutil (Hardware battery query)
-    try:
-        import psutil
-        b = psutil.sensors_battery()
-        if b is not None:
-            return {
-                "percent": int(b.percent),
-                "is_charging": bool(b.power_plugged),
-                "source": "psutil"
-            }
-    except Exception:
-        pass
+    # 2. psutil (Hardware battery query — local/desktop only, not available on Vercel)
+    if not DATABASE_URL:
+        try:
+            import psutil
+            b = psutil.sensors_battery()
+            if b is not None:
+                return {
+                    "percent": int(b.percent),
+                    "is_charging": bool(b.power_plugged),
+                    "source": "psutil"
+                }
+        except Exception:
+            pass
 
-    # 3. Windows ctypes kernel32 GetSystemPowerStatus
-    try:
-        import ctypes
-        from ctypes import wintypes
+    # 3. Windows ctypes kernel32 GetSystemPowerStatus (local Windows only)
+    if not DATABASE_URL:
+        try:
+            import ctypes
+            from ctypes import wintypes
         class SYSTEM_POWER_STATUS(ctypes.Structure):
             _fields_ = [
                 ('ACLineStatus', wintypes.BYTE),
@@ -1110,7 +1277,7 @@ def get_battery_info() -> dict:
 
     # 4. Fallback to cached device_status if exists
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_db_conn()
         c = conn.cursor()
         c.execute("SELECT battery_percent, is_charging, updated_at FROM device_status WHERE id = 1")
         row = c.fetchone()
@@ -1129,7 +1296,7 @@ def get_battery_info() -> dict:
 
 def update_device_battery_status(percent: int, is_charging: bool):
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     now_iso = datetime.now().isoformat()
     c.execute("SELECT id, last_alerted_50, last_alerted_40 FROM device_status WHERE id = 1")
@@ -1164,7 +1331,7 @@ def check_and_send_battery_alerts(send_telegram_fn=None) -> dict:
     percent = b_info.get("percent", 100)
     is_charging = b_info.get("is_charging", True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT last_alerted_50, last_alerted_40 FROM device_status WHERE id = 1")
     row = c.fetchone()
@@ -1419,12 +1586,19 @@ Return STRICT JSON format:
 def record_heartbeat(username: str = "lighthouse_bot"):
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_db_conn()
         c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO bot_heartbeat (id, last_seen, bot_username, status) VALUES (1, ?, ?, 'online')",
-            (datetime.now().isoformat(), username)
-        )
+        if DATABASE_URL:
+            c.execute(
+                """INSERT INTO bot_heartbeat (id, last_seen, bot_username, status) VALUES (1, %s, %s, 'online')
+                   ON CONFLICT (id) DO UPDATE SET last_seen=EXCLUDED.last_seen, bot_username=EXCLUDED.bot_username, status='online'""",
+                (datetime.now().isoformat(), username)
+            )
+        else:
+            c.execute(
+                "INSERT OR REPLACE INTO bot_heartbeat (id, last_seen, bot_username, status) VALUES (1, ?, ?, 'online')",
+                (datetime.now().isoformat(), username)
+            )
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1433,7 +1607,7 @@ def record_heartbeat(username: str = "lighthouse_bot"):
 
 def get_bot_status():
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_conn()
     c = conn.cursor()
     c.execute("SELECT last_seen, bot_username, status FROM bot_heartbeat WHERE id = 1")
     row = c.fetchone()
